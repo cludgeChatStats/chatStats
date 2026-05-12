@@ -12,19 +12,56 @@ DB_PATH = os.environ.get('DB_PATH', 'stats.db')
 PORT = int(os.environ.get('PORT', 5000))
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
-def init_db():
+def migrate_db():
+    """Убираем UNIQUE constraint с conversation_id без потери данных"""
     with sqlite3.connect(DB_PATH, timeout=10) as conn:
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS closed_chats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                operator_name TEXT NOT NULL,
-                conversation_id TEXT NOT NULL UNIQUE,
-                closed_at_utc TEXT NOT NULL
-            )
-        ''')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_chats(closed_at_utc)')
-    print("✅ База данных готова")
+        # Проверяем, существует ли таблица closed_chats
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='closed_chats'")
+        if cursor.fetchone():
+            # Проверяем, есть ли ограничение UNIQUE (попробуем создать новую таблицу)
+            conn.execute("PRAGMA foreign_keys = OFF")
+            # Создаём новую таблицу без UNIQUE
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS closed_chats_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operator_name TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    closed_at_utc TEXT NOT NULL
+                )
+            ''')
+            # Копируем все старые данные
+            conn.execute('''
+                INSERT INTO closed_chats_new (id, operator_name, conversation_id, closed_at_utc)
+                SELECT id, operator_name, conversation_id, closed_at_utc FROM closed_chats
+            ''')
+            # Удаляем старую таблицу
+            conn.execute("DROP TABLE closed_chats")
+            # Переименовываем новую
+            conn.execute("ALTER TABLE closed_chats_new RENAME TO closed_chats")
+            # Создаём обычный индекс для скорости
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_id ON closed_chats(conversation_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_chats(closed_at_utc)")
+            conn.execute("PRAGMA foreign_keys = ON")
+            print("✅ Миграция выполнена: ограничение UNIQUE удалено")
+        else:
+            # Таблицы нет, создаём без UNIQUE
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS closed_chats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operator_name TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    closed_at_utc TEXT NOT NULL
+                )
+            ''')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_id ON closed_chats(conversation_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_chats(closed_at_utc)")
+            print("✅ Таблица создана без UNIQUE")
+
+def init_db():
+    # Включаем WAL для производительности
+    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+        conn.execute('PRAGMA journal_mode = WAL')
+    migrate_db()
 
 init_db()
 
@@ -68,20 +105,14 @@ def webhook():
     try:
         payload = request.get_json(silent=True)
         if not payload:
-            print("❌ Нет JSON")
             return ("", 200)
 
-        # Событие на верхнем уровне
         event = payload.get('event')
-        print(f"📥 event={event}")
-
         if event != 'chat.closed':
             return ("", 200)
 
-        # Данные внутри payload['data']
         data = payload.get('data')
         if not data:
-            print("❌ Нет data в payload")
             return ("", 200)
 
         operator = data.get('operator') or {}
@@ -90,27 +121,17 @@ def webhook():
         conv_id = conversation.get('id')
         closed_at = conversation.get('closed_at')
 
-        print(f"🔍 operator_name={operator_name}, conv_id={conv_id}, closed_at={closed_at}")
-
-        if not operator_name:
-            print("❌ Нет operator_name")
-            return ("", 200)
-        if not conv_id:
-            print("❌ Нет conversation.id")
-            return ("", 200)
-        if not closed_at:
-            print("❌ Нет closed_at")
+        if not operator_name or not conv_id or not closed_at:
+            print(f"⚠️ Пропущен: name={operator_name}, id={conv_id}, closed_at={closed_at}")
             return ("", 200)
 
+        # Обычная вставка без игнорирования дублей
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
             conn.execute('''
-                INSERT OR IGNORE INTO closed_chats (operator_name, conversation_id, closed_at_utc)
+                INSERT INTO closed_chats (operator_name, conversation_id, closed_at_utc)
                 VALUES (?, ?, ?)
             ''', (operator_name, conv_id, closed_at))
-            if conn.total_changes:
-                print(f"✅ Сохранён {operator_name} - {conv_id}")
-            else:
-                print(f"⚠️ Дубликат {conv_id}")
+            print(f"✅ Сохранён {operator_name} - {conv_id} (дубли разрешены)")
         return ("", 200)
     except Exception as e:
         print(f"❌ Ошибка: {e}")
@@ -136,13 +157,14 @@ def stats():
     <head><meta charset="utf-8"><title>Статистика за сегодня</title>
     <style>
         body {{ font-family: sans-serif; margin: 40px; }}
-        table {{ border-collapse: collapse; width: 50%; }}
+        table {{ border-collapse: collapse; width: 50%%; }}
         th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
         th {{ background-color: #f2f2f2; }}
     </style>
     </head>
     <body>
     <h2>📊 Закрытые чаты за {today.isoformat()}</h2>
+    <p><em>Внимание: дубликаты вебхуков учитываются отдельно.</em></p>
     <table>
     <tr><th>#</th><th>Оператор</th><th>Кол-во</th></tr>
     '''
@@ -153,7 +175,6 @@ def stats():
             html += f'<tr><td>{i}</td><td>{name}</td><td><b>{count}</b></td></tr>'
     html += '''
     </table>
-    <p><em>Данные обновляются автоматически при поступлении вебхуков.</em></p>
     </body>
     </html>
     '''
@@ -165,8 +186,8 @@ def debug():
         rows = conn.execute("SELECT id, operator_name, conversation_id, closed_at_utc FROM closed_chats").fetchall()
     if not rows:
         return "Таблица пуста"
-    result = "<h3>Все записи</h3><table border='1'>"
-    result += "<tr><th>ID</th><th>Оператор</th><th>Conversation ID</th><th>closed_at (UTC)</th></tr>"
+    result = "<h3>Все записи (включая дубликаты)</h3><table border='1'>"
+    result += "<tr><th>ID</th><th>Оператор</th><th>Conversation ID</th><th>closed_at (UTC)</th></table>"
     for row in rows:
         result += f"<tr><td>{row[0]}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td></tr>"
     result += "</table>"

@@ -15,12 +15,9 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 def migrate_db():
     """Убираем UNIQUE constraint с conversation_id без потери данных"""
     with sqlite3.connect(DB_PATH, timeout=10) as conn:
-        # Проверяем, существует ли таблица closed_chats
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='closed_chats'")
         if cursor.fetchone():
-            # Проверяем, есть ли ограничение UNIQUE (попробуем создать новую таблицу)
             conn.execute("PRAGMA foreign_keys = OFF")
-            # Создаём новую таблицу без UNIQUE
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS closed_chats_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,22 +26,17 @@ def migrate_db():
                     closed_at_utc TEXT NOT NULL
                 )
             ''')
-            # Копируем все старые данные
             conn.execute('''
                 INSERT INTO closed_chats_new (id, operator_name, conversation_id, closed_at_utc)
                 SELECT id, operator_name, conversation_id, closed_at_utc FROM closed_chats
             ''')
-            # Удаляем старую таблицу
             conn.execute("DROP TABLE closed_chats")
-            # Переименовываем новую
             conn.execute("ALTER TABLE closed_chats_new RENAME TO closed_chats")
-            # Создаём обычный индекс для скорости
             conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_id ON closed_chats(conversation_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_at ON closed_chats(closed_at_utc)")
             conn.execute("PRAGMA foreign_keys = ON")
             print("✅ Миграция выполнена: ограничение UNIQUE удалено")
         else:
-            # Таблицы нет, создаём без UNIQUE
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS closed_chats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,7 +50,6 @@ def migrate_db():
             print("✅ Таблица создана без UNIQUE")
 
 def init_db():
-    # Включаем WAL для производительности
     with sqlite3.connect(DB_PATH, timeout=10) as conn:
         conn.execute('PRAGMA journal_mode = WAL')
     migrate_db()
@@ -125,7 +116,6 @@ def webhook():
             print(f"⚠️ Пропущен: name={operator_name}, id={conv_id}, closed_at={closed_at}")
             return ("", 200)
 
-        # Обычная вставка без игнорирования дублей
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
             conn.execute('''
                 INSERT INTO closed_chats (operator_name, conversation_id, closed_at_utc)
@@ -156,14 +146,35 @@ def stats():
     <html>
     <head><meta charset="utf-8"><title>Статистика за сегодня</title>
     <style>
-        body {{ font-family: sans-serif; margin: 40px; }}
-        table {{ border-collapse: collapse; width: 50%%; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-        th {{ background-color: #f2f2f2; }}
+        body {{
+            font-family: sans-serif;
+            margin: 30px;
+            font-size: 12px;
+        }}
+        table {{
+            border-collapse: collapse;
+            width: 37.5%;
+        }}
+        th, td {{
+            border: 1px solid #ddd;
+            padding: 6px;
+            text-align: left;
+        }}
+        th {{
+            background-color: #f2f2f2;
+        }}
+        h2 {{
+            font-size: 1.5em;
+            margin-top: 0;
+        }}
+        p {{
+            font-size: 1em;
+        }}
     </style>
     </head>
     <body>
     <h2>📊 Закрытые чаты за {today.isoformat()}</h2>
+    <p><em>Внимание: дубликаты вебхуков учитываются отдельно.</em></p>
     <table>
     <tr><th>#</th><th>Оператор</th><th>Кол-во</th></tr>
     '''
@@ -186,7 +197,7 @@ def debug():
     if not rows:
         return "Таблица пуста"
     result = "<h3>Все записи (включая дубликаты)</h3><table border='1'>"
-    result += "<tr><th>ID</th><th>Оператор</th><th>Conversation ID</th><th>closed_at (UTC)</th></table>"
+    result += "<tr><th>ID</th><th>Оператор</th><th>Conversation ID</th><th>closed_at (UTC)</th></tr>"
     for row in rows:
         result += f"<tr><td>{row[0]}</td><td>{row[1]}</td><td>{row[2]}</td><td>{row[3]}</td></tr>"
     result += "</table>"
